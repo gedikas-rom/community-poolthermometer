@@ -9,13 +9,37 @@
 #include <Fonts/FreeSansBold12pt7b.h>
 #include <Fonts/FreeSans9pt7b.h>
 #include <imagedata.h>
+#include <Arduino.h>
+#include <ArduinoJson.h>
+#include <Button.h>
+#include <driver/rtc_io.h>
 
+#define VOLTAGE_PIN 0  // Battery Voltage Pin
+#define BUTTON1_PIN GPIO_NUM_1  // Button 1 Pin
+#define BUTTON2_PIN GPIO_NUM_2  // Button 2 Pin
+#define BUTTON3_PIN GPIO_NUM_21  // Button 3 Pin
 #define TEMP_PIN 22    // DS18B20 Datenleitung Lufttemperatur
+#define CS_PIN 23    // Display CS Pin
+#define BUSY_PIN 16  // Display BUSY Pin
+#define RST_PIN 17   // Display RST Pin
+#define DC_PIN 20    // Display DC Pin
+
+#define uS_TO_S_FACTOR 1000000ULL  /* Conversion factor for micro seconds to seconds */
+#define TIME_TO_SLEEP  120        /* Time ESP32 will go to sleep (in seconds) */
+#define BUTTON_PIN_BITMASK (1ULL << BUTTON1_PIN) | (1ULL << BUTTON2_PIN) 
+//| (1ULL << BUTTON3_PIN) // GPIO 0 bitmask for ext1
+
+const char* firmware = "0.2.5";
+Button btnLeft(BUTTON1_PIN);
+Button btnMiddle(BUTTON2_PIN);
+Button btnRight(BUTTON3_PIN);
 
 // E-Paper config
-// ESP32-C3 CS(SS)=7,SCL(SCK)=4,SDA(MOSI)=6,BUSY=3,RES(RST)=2,DC=1
+// ESP32-C3 Supermini CS(SS)=7,SCL(SCK)=4,SDA(MOSI)=6,BUSY=3,RES(RST)=2,DC=1
+// XIAO ESP32-C6 CS(SS)=7,SCL(SCK)=19,SDA(MOSI)=18,BUSY=3,RES(RST)=2,DC=1
 // 2.9'' EPD Module
-GxEPD2_BW<GxEPD2_290_BS, GxEPD2_290_BS::HEIGHT> display(GxEPD2_290_BS(/*CS=5*/ 7, /*DC=*/ 1, /*RES=*/ 2, /*BUSY=*/ 3)); // DEPG0290BS 128x296, SSD1680
+//GxEPD2_BW<GxEPD2_290_BS, GxEPD2_290_BS::HEIGHT> display(GxEPD2_290_BS(/*CS=5*/ 7, /*DC=*/ 1, /*RES=*/ 2, /*BUSY=*/ 3)); // DEPG0290BS 128x296, SSD1680
+GxEPD2_BW<GxEPD2_290_BS, GxEPD2_290_BS::HEIGHT> display(GxEPD2_290_BS(/*CS=5*/ CS_PIN, /*DC=*/ DC_PIN, /*RES=*/ RST_PIN, /*BUSY=*/ BUSY_PIN)); // DEPG0290BS 128x296, SSD1680
 //GxEPD2_3C<GxEPD2_290_C90c, GxEPD2_290_C90c::HEIGHT> display(GxEPD2_290_C90c(/*CS=5*/ 7, /*DC=*/ 1, /*RES=*/ 2, /*BUSY=*/ 3)); // GDEM029C90 128x296, SSD1680
 
 enum ValveState {
@@ -43,12 +67,6 @@ typedef struct struct_message_receive {
   int currentPumpState;
 } struct_message_receive;
 
-typedef struct struct_message_send {
-  char command[32];
-  char parameter[32];
-} struct_message_send;
-
-struct_message_send myDataSend;
 struct_message_receive myDataReceive;
 
 OneWire32 ds(TEMP_PIN);
@@ -75,9 +93,35 @@ void setPoolControlMode(String mode);
 void measureVoltage();
 void getPoolControlValues();
 void prepareDisplay();
+void setSensorData();
+void sendMessage(String payload);
+void btnTaskHandling(void *parameter);
+void checkButtons();
+void checkButtons(int wakeupBtnPin);
+void startDeepSleep();
+
+RTC_DATA_ATTR int bootCount = 0;
+
+void print_wakeup_reason(){
+  esp_sleep_wakeup_cause_t wakeup_reason;
+
+  wakeup_reason = esp_sleep_get_wakeup_cause();
+
+  switch(wakeup_reason)
+  {
+    case ESP_SLEEP_WAKEUP_EXT0 : Serial.println("Wakeup caused by external signal using RTC_IO"); break;
+    case ESP_SLEEP_WAKEUP_EXT1 : Serial.println("Wakeup caused by external signal using RTC_CNTL"); break;
+    case ESP_SLEEP_WAKEUP_TIMER : Serial.println("Wakeup caused by timer"); break;
+    case ESP_SLEEP_WAKEUP_TOUCHPAD : Serial.println("Wakeup caused by touchpad"); break;
+    case ESP_SLEEP_WAKEUP_ULP : Serial.println("Wakeup caused by ULP program"); break;
+    default : Serial.printf("Wakeup was not caused by deep sleep: %d\n",wakeup_reason); break;
+  }
+}
 
 void setup() {
   Serial.begin(115200);
+  // Pin config
+  pinMode(VOLTAGE_PIN, INPUT);         // Configure A0 as ADC input
 
   // Wifi config
   WiFi.mode(WIFI_STA);
@@ -104,22 +148,49 @@ void setup() {
     return;
   }
 
-  display.init(115200,true,50,false);
-  prepareDisplay();
-
+  if (bootCount == 0)
+  {
+    // first boot
+    display.init(115200,true,50,false);
+    prepareDisplay();
+  } else {
+    // wake up from deep sleep
+    display.init(115200,false,50,false);
+    checkButtons(__builtin_ffsll(esp_sleep_get_ext1_wakeup_status())-1);
+  }
+  
     //to find addresses for temp bus
 	foundDevices = ds.search(addr, maxDevices);
 	for (uint8_t j = 0; j < foundDevices; j += 1) {
 		Serial.printf("Temp %d: 0x%llx,\n", j, addr[j]);
 	}
+
+  xTaskCreate(btnTaskHandling, "btnTaskHandling", 1024, NULL, 1, NULL);
+  ++bootCount;
+  Serial.println("Boot number: " + String(bootCount));
+
+  //Print the wakeup reason for ESP32
+  print_wakeup_reason();
 }
 
 void loop() {
   measureTemperature();
-  setPoolControlMode("ON");
   measureVoltage();
+  setSensorData();
+
   getPoolControlValues();
-  delay(10000);
+  delay(3000);
+  
+  startDeepSleep();
+  delay(7000);
+}
+
+void startDeepSleep(){
+  display.hibernate();
+  // Prepare wakeup
+  esp_sleep_enable_ext1_wakeup(BUTTON_PIN_BITMASK,ESP_EXT1_WAKEUP_ANY_LOW);
+  esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
+  esp_deep_sleep_start();
 }
 
 // callback when data is sent
@@ -136,8 +207,47 @@ void OnDataRecv(const esp_now_recv_info_t *esp_now_info, const uint8_t *incoming
   updateDisplay_PoolControlValues();
 }
 
+void btnTaskHandling(void *parameter){
+  while(1){
+    checkButtons();
+    vTaskDelay(pdMS_TO_TICKS(250)); // 250ms
+  }
+}
+
+void checkButtons(int wakeupBtnPin)
+{
+  int btnL = (wakeupBtnPin < 0 ? btnLeft.checkBtn() : (wakeupBtnPin == BUTTON1_PIN ? 1 : 0));
+  int btnM = (wakeupBtnPin < 0 ? btnMiddle.checkBtn() : (wakeupBtnPin == BUTTON2_PIN ? 1 : 0));
+  int btnR = (wakeupBtnPin < 0 ? btnRight.checkBtn() : (wakeupBtnPin == BUTTON3_PIN ? 1 : 0));
+
+  if (btnL > 1) {
+    Serial.println("Button L pressed");
+    setPoolControlMode("AUTO");
+  }
+  if (btnM > 1) {
+    Serial.println("Button M pressed");
+    setPoolControlMode("ON");
+  }
+  if (btnR > 1) {
+    Serial.println("Button R pressed");
+    setPoolControlMode("OFF");
+  }
+}
+
+void checkButtons(){
+  checkButtons(-1); // -1 = no wakeup button = check all buttons
+}
+
 void measureVoltage(){
-  float voltage = random(3412, 4095); // analogRead(33)
+  /*
+  uint32_t Vbatt = 0;
+  for(int i = 0; i < 16; i++) {
+    Vbatt += analogReadMilliVolts(VOLTAGE_PIN); // Read and accumulate ADC voltage
+  }
+  float voltage = 2 * Vbatt / 16 / 1000.0;     // Adjust for 1:2 divider and convert to volts
+  Serial.println(voltage, 3);                  // Output voltage to 3 decimal places
+  */
+  float voltage = random(3412, 4095); // analogRead(VOLTAGE_PIN);
   batteryLevel = map(voltage, 3412, 4095, 0, 100);
   updateDisplay_BatteryState();
 }
@@ -174,38 +284,66 @@ void measureTemperature(){
   updateDisplay_Temperature();
 }
 
-void getPoolControlValues() {
-  // Send message via ESP-NOW
-  char cmd[] = "get-values";
-  memcpy(&myDataSend.command, cmd, sizeof(cmd));
-  esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *) &myDataSend, sizeof(myDataSend));
+void sendMessage(String payload)
+{
+  esp_err_t result = esp_now_send(broadcastAddress, (uint8_t*)payload.c_str(), payload.length());
   if (result == ESP_OK) {
     Serial.println("Sent with success");
   }
   else {
     Serial.println("Error sending the data");
   }
+}
+
+void getPoolControlValues() {
+  JsonDocument doc;
+
+  // Add values in the document
+  doc["cmd"] = "get-values";
+
+  String payload = "";
+
+  // Generate the minified JSON and send it to the Serial port
+  serializeJson(doc,payload);
+  sendMessage(payload);
 }
 
 void setPoolControlMode(String mode) {
   // Send message via ESP-NOW
-  char cmd[] = "set-mode";
-  char parameter[mode.length()+1];
-  strcpy(parameter, mode.c_str());
-  memcpy(&myDataSend.command, cmd, sizeof(cmd));
-  memcpy(&myDataSend.parameter, parameter, sizeof(parameter));
-  esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *) &myDataSend, sizeof(myDataSend));
-  if (result == ESP_OK) {
-    Serial.println("Sent with success");
-  }
-  else {
-    Serial.println("Error sending the data");
-  }
+  JsonDocument doc;
+
+  // Add values in the document
+  doc["cmd"] = "set-mode";
+  doc["mode"] = mode.c_str();
+
+  String payload = "";
+
+  // Generate the minified JSON and send it to the Serial port
+  serializeJson(doc,payload);
+  sendMessage(payload);
 }
 
+void setSensorData()
+{
+  // Send message via ESP-NOW
+  JsonDocument doc;
+
+  // Add values in the document
+  doc["cmd"] = "set-sensordata";
+  doc["sensor"] = "temperature";
+  doc["location"] = "pavilion";
+  doc["value"] = localTemperature;
+  doc["battery"] = batteryLevel;
+  doc["firmware"] = firmware;
+	String payload = "";
+
+  // Generate the minified JSON and send it to the Serial port
+  serializeJson(doc,payload);
+  sendMessage(payload);
+}
 
 void prepareDisplay(){
-  display.setRotation(1);
+  display.setRotation(3);
   display.setFont(&FreeSansBold24pt7b);
   display.setTextColor(GxEPD_BLACK);
   uint16_t x = 5; 
@@ -307,6 +445,8 @@ void updateDisplay_Temperature(){
   uint16_t box_y = y-box_h+2; 
 
   // local temperature pavilion 
+  display.setRotation(3);
+  display.setFont(&FreeSansBold24pt7b);
   display.setTextColor(GxEPD_BLACK);
   display.setPartialWindow(box_x+2*display.width()/3, box_y, box_w, box_h);
   display.firstPage();
@@ -332,6 +472,7 @@ void updateDisplay_BatteryState(){
   uint16_t box_x = x;
   uint16_t box_y = display.height()-10; 
 
+  display.setRotation(3);
   display.setPartialWindow(box_x, box_y, box_w, box_h);
   display.firstPage();
   do
