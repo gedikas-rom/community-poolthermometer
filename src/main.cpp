@@ -14,10 +14,10 @@
 #include <Button.h>
 #include <driver/rtc_io.h>
 
-#define VOLTAGE_PIN 0  // Battery Voltage Pin
-#define BUTTON1_PIN GPIO_NUM_1  // Button 1 Pin
-#define BUTTON2_PIN GPIO_NUM_2  // Button 2 Pin
-#define BUTTON3_PIN GPIO_NUM_21  // Button 3 Pin
+#define VOLTAGE_PIN 5  // Battery Voltage Pin
+#define BUTTON1_PIN GPIO_NUM_0  // Button 1 Pin
+#define BUTTON2_PIN GPIO_NUM_1  // Button 2 Pin
+#define BUTTON3_PIN GPIO_NUM_2  // Button 3 Pin
 #define TEMP_PIN 22    // DS18B20 Datenleitung Lufttemperatur
 #define CS_PIN 23    // Display CS Pin
 #define BUSY_PIN 16  // Display BUSY Pin
@@ -26,10 +26,10 @@
 
 #define uS_TO_S_FACTOR 1000000ULL  /* Conversion factor for micro seconds to seconds */
 #define TIME_TO_SLEEP  120        /* Time ESP32 will go to sleep (in seconds) */
-#define BUTTON_PIN_BITMASK (1ULL << BUTTON1_PIN) | (1ULL << BUTTON2_PIN) 
+#define BUTTON_PIN_BITMASK (1ULL << BUTTON1_PIN) | (1ULL << BUTTON2_PIN) | (1ULL << BUTTON3_PIN)
 //| (1ULL << BUTTON3_PIN) // GPIO 0 bitmask for ext1
 
-const char* firmware = "0.2.5";
+const char* firmware = "0.3.1";
 Button btnLeft(BUTTON1_PIN);
 Button btnMiddle(BUTTON2_PIN);
 Button btnRight(BUTTON3_PIN);
@@ -53,7 +53,8 @@ enum ValveState {
 enum Mode {
   AUTO,   // automatic mode
   ON,     // Solar heating on, pump full power
-  OFF     // Solar heating off, pump in eco mode (lowest level)
+  OFF,          // Solar heating off, pump in eco mode (lowest level)
+  CLEANING     // Solar heating off, pump full power for max cleaning
 };
 
 // ESP-NOW config
@@ -74,7 +75,7 @@ const uint8_t maxDevices = 2;  // max devices per bus
 uint8_t foundDevices = 0;
 uint64_t addr[maxDevices];
 float currTemp[maxDevices];
-
+bool bNoSleep = false; // Flag to prevent deep sleep
 int batteryLevel;
 float localTemperature;
 
@@ -121,7 +122,7 @@ void print_wakeup_reason(){
 void setup() {
   Serial.begin(115200);
   // Pin config
-  pinMode(VOLTAGE_PIN, INPUT);         // Configure A0 as ADC input
+  pinMode(VOLTAGE_PIN, INPUT);         // Configure A5 as ADC input
 
   // Wifi config
   WiFi.mode(WIFI_STA);
@@ -177,11 +178,20 @@ void loop() {
   measureTemperature();
   measureVoltage();
   setSensorData();
-
+  //delay(1000);
   getPoolControlValues();
-  delay(3000);
-  
-  startDeepSleep();
+  delay(2000);
+
+  // check middle button to prevent deep sleep
+  bNoSleep = (btnMiddle.checkBtn() == 2); // long press on middle button
+  Serial.printf("bNoSleep: %d, %d\n", bNoSleep, btnMiddle.checkBtn());  
+  if (bNoSleep) {
+    Serial.println("No sleep requested, waiting for button press...");
+    bNoSleep = false; // reset flag
+  } else {
+    Serial.println("Going to deep sleep...");
+    startDeepSleep();
+  }
   delay(7000);
 }
 
@@ -220,15 +230,15 @@ void checkButtons(int wakeupBtnPin)
   int btnM = (wakeupBtnPin < 0 ? btnMiddle.checkBtn() : (wakeupBtnPin == BUTTON2_PIN ? 1 : 0));
   int btnR = (wakeupBtnPin < 0 ? btnRight.checkBtn() : (wakeupBtnPin == BUTTON3_PIN ? 1 : 0));
 
-  if (btnL > 1) {
+  if (btnL > 0) {
     Serial.println("Button L pressed");
     setPoolControlMode("AUTO");
   }
-  if (btnM > 1) {
+  if (btnM > 0) {
     Serial.println("Button M pressed");
     setPoolControlMode("ON");
   }
-  if (btnR > 1) {
+  if (btnR > 0) {
     Serial.println("Button R pressed");
     setPoolControlMode("OFF");
   }
@@ -239,16 +249,18 @@ void checkButtons(){
 }
 
 void measureVoltage(){
-  /*
+  
   uint32_t Vbatt = 0;
   for(int i = 0; i < 16; i++) {
     Vbatt += analogReadMilliVolts(VOLTAGE_PIN); // Read and accumulate ADC voltage
   }
-  float voltage = 2 * Vbatt / 16 / 1000.0;     // Adjust for 1:2 divider and convert to volts
+  float voltage = 2 * Vbatt / 16;     // Adjust for 1:2 divider and convert to volts
   Serial.println(voltage, 3);                  // Output voltage to 3 decimal places
-  */
-  float voltage = random(3412, 4095); // analogRead(VOLTAGE_PIN);
-  batteryLevel = map(voltage, 3412, 4095, 0, 100);
+  
+  voltage = voltage > 4000 ? 4000 : voltage; // limit to 4.1V
+  voltage = voltage < 3400 ? 3400 : voltage; // limit to 3.4V 
+  //float voltage = random(3412, 4095); // analogRead(VOLTAGE_PIN);
+  batteryLevel = map(voltage, 3400, 4000, 0, 100);
   updateDisplay_BatteryState();
 }
 
@@ -259,7 +271,9 @@ bool isValidTemperatureAir(float temp){
 void measureTemperature(){
   // measure 
   int validMeasures = 0;
+  localTemperature = 0;
   ds.request();
+  // read
   for(byte j = 0; j < foundDevices; j++){
     uint8_t err = ds.getTemp(addr[j], currTemp[j]);
     if(err){
@@ -276,7 +290,7 @@ void measureTemperature(){
 	}
   
   if (validMeasures>0)
-    localTemperature = validMeasures/validMeasures;
+    localTemperature = localTemperature/validMeasures;
   else
     localTemperature = random(1200, 2900)/100;
   
@@ -429,6 +443,7 @@ void updateDisplay_PoolControlValues(){
     switch (myDataReceive.mode) {
       case ON: display.printf("Manuell - AN"); break;
       case OFF: display.printf("Manuell - AUS"); break;
+      case CLEANING: display.printf("Manuell - REINIGUNG"); break;
       case AUTO: display.printf("AUTO"); break;
     }
    }
