@@ -8,11 +8,13 @@
 #include <Fonts/FreeSansBold24pt7b.h>
 #include <Fonts/FreeSansBold12pt7b.h>
 #include <Fonts/FreeSans9pt7b.h>
+#include <Fonts/TomThumb.h>
 #include <imagedata.h>
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <Button.h>
 #include <driver/rtc_io.h>
+#include <time.h>
 
 #define VOLTAGE_PIN 5  // Battery Voltage Pin
 #define BUTTON1_PIN GPIO_NUM_0  // Button 1 Pin
@@ -29,7 +31,7 @@
 #define BUTTON_PIN_BITMASK (1ULL << BUTTON1_PIN) | (1ULL << BUTTON2_PIN) | (1ULL << BUTTON3_PIN)
 //| (1ULL << BUTTON3_PIN) // GPIO 0 bitmask for ext1
 
-const char* firmware = "0.3.1";
+const char* firmware = "0.4.0";
 Button btnLeft(BUTTON1_PIN);
 Button btnMiddle(BUTTON2_PIN);
 Button btnRight(BUTTON3_PIN);
@@ -66,6 +68,7 @@ typedef struct struct_message_receive {
   Mode mode;
   ValveState currentValveState;
   int currentPumpState;
+  tm lastUpdate; // Last update time
 } struct_message_receive;
 
 struct_message_receive myDataReceive;
@@ -82,10 +85,12 @@ float localTemperature;
 // REPLACE WITH Pool Controller MAC Address
 // 54:32:04:11:D4:FC
 uint8_t broadcastAddress[] = {0x54, 0x32, 0x04, 0x11, 0xD4, 0xFC};
+//uint8_t broadcastAddress[] = {0x54, 0x32, 0x04, 0x11, 0xD4, 0xFC};
 
 void OnDataRecv(const esp_now_recv_info_t *esp_now_info, const uint8_t *incomingData, int len);
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status);
 void updateDisplay_PoolControlValues();
+void updateDisplay_LastUpdate();
 void updateDisplay_Temperature();
 void updateDisplay_BatteryState();
 bool isValidTemperatureAir(float temp);
@@ -154,6 +159,10 @@ void setup() {
     // first boot
     display.init(115200,true,50,false);
     prepareDisplay();
+    configTime(0, 0, "poolthermometer.local", "poolthermometer.local");
+    //time_t rtc =  1751640850; // 1751640850 = 4 July 2025 14:54:28 MEZ+1
+    //timeval tv = { rtc, 0 };
+    //settimeofday(&tv, nullptr);
   } else {
     // wake up from deep sleep
     display.init(115200,false,50,false);
@@ -178,10 +187,10 @@ void loop() {
   measureTemperature();
   measureVoltage();
   setSensorData();
-  //delay(1000);
-  getPoolControlValues();
-  delay(2000);
-
+  delay(3000);
+  //getPoolControlValues();
+  //delay(2000);
+  //updateDisplay_LastUpdate();
   // check middle button to prevent deep sleep
   bNoSleep = (btnMiddle.checkBtn() == 2); // long press on middle button
   Serial.printf("bNoSleep: %d, %d\n", bNoSleep, btnMiddle.checkBtn());  
@@ -214,7 +223,9 @@ void OnDataRecv(const esp_now_recv_info_t *esp_now_info, const uint8_t *incoming
   memcpy(&myDataReceive, incomingData, sizeof(myDataReceive));
   Serial.printf("%.1f°C", myDataReceive.averageTempWater);
   Serial.println("Data received...refresh values");
+  Serial.println(myDataReceive.lastUpdate.tm_year);
   updateDisplay_PoolControlValues();
+  updateDisplay_LastUpdate();
 }
 
 void btnTaskHandling(void *parameter){
@@ -300,6 +311,9 @@ void measureTemperature(){
 
 void sendMessage(String payload)
 {
+  Serial.println("Sending message: " + payload);
+    Serial.println(WiFi.macAddress());
+
   esp_err_t result = esp_now_send(broadcastAddress, (uint8_t*)payload.c_str(), payload.length());
   if (result == ESP_OK) {
     Serial.println("Sent with success");
@@ -349,6 +363,7 @@ void setSensorData()
   doc["value"] = localTemperature;
   doc["battery"] = batteryLevel;
   doc["firmware"] = firmware;
+  doc["return"] = "get-values"; // request values after setting sensor data
 	String payload = "";
 
   // Generate the minified JSON and send it to the Serial port
@@ -429,7 +444,7 @@ void updateDisplay_PoolControlValues(){
   while (display.nextPage());
   
   // mode 
-  box_w = 120;
+  box_w = 160;
   box_h = 16;
   box_y = display.height()-20-box_h+2;
   display.setPartialWindow(box_x, box_y, box_w, box_h);
@@ -448,7 +463,7 @@ void updateDisplay_PoolControlValues(){
     }
    }
   while (display.nextPage());
-
+  updateDisplay_LastUpdate();
 }
 
 void updateDisplay_Temperature(){
@@ -474,6 +489,38 @@ void updateDisplay_Temperature(){
     display.setFont(&FreeSansBold12pt7b);
     display.printf(".%.0f\n", (localTemperature-(int)localTemperature)*10);
     Serial.printf("local Temp: %.1f", localTemperature);
+  }
+  while (display.nextPage());
+
+}
+
+void updateDisplay_LastUpdate(){
+  return;
+  uint16_t box_w = 100;
+  uint16_t box_h = 10;
+  uint16_t box_x = 200;
+  uint16_t box_y = display.height()-10; 
+  Serial.println(&myDataReceive.lastUpdate, "%A, %B %d %Y %H:%M:%S");
+  
+  if (myDataReceive.lastUpdate.tm_year == 0)
+  {
+    // no last update time available
+    Serial.println("No last update time available");
+    return;
+  }
+
+  // last update 
+  display.setRotation(3);
+  display.setFont(&TomThumb);
+  display.setTextColor(GxEPD_BLACK);
+  display.setPartialWindow(box_x, box_y, box_w, box_h);
+  display.firstPage();
+  do
+  {
+    display.fillRect(box_x, box_y, box_w, box_h, GxEPD_WHITE);
+    display.setCursor(box_x, box_y);
+    display.println(&myDataReceive.lastUpdate, "%B %d %Y %H:%M:%S");
+    Serial.println(&myDataReceive.lastUpdate, "%A, %B %d %Y %H:%M:%S");
   }
   while (display.nextPage());
 
