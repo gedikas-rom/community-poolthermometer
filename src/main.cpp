@@ -15,12 +15,13 @@
 #include <Button.h>
 #include <driver/rtc_io.h>
 #include <time.h>
+#include "sensor_message.h"
 
 #define VOLTAGE_PIN 5  // Battery Voltage Pin
 #define BUTTON1_PIN GPIO_NUM_0  // Button 1 Pin
 #define BUTTON2_PIN GPIO_NUM_1  // Button 2 Pin
 #define BUTTON3_PIN GPIO_NUM_2  // Button 3 Pin
-#define TEMP_PIN 22    // DS18B20 Datenleitung Lufttemperatur
+#define TEMP_PIN 22    // DS18B20 data line for air temperature
 #define CS_PIN 23    // Display CS Pin
 #define BUSY_PIN 16  // Display BUSY Pin
 #define RST_PIN 17   // Display RST Pin
@@ -31,7 +32,7 @@
 #define BUTTON_PIN_BITMASK (1ULL << BUTTON1_PIN) | (1ULL << BUTTON2_PIN) | (1ULL << BUTTON3_PIN)
 //| (1ULL << BUTTON3_PIN) // GPIO 0 bitmask for ext1
 
-const char* firmware = "0.4.0";
+const char* firmware = "0.6.0";
 Button btnLeft(BUTTON1_PIN);
 Button btnMiddle(BUTTON2_PIN);
 Button btnRight(BUTTON3_PIN);
@@ -72,6 +73,9 @@ typedef struct struct_message_receive {
 } struct_message_receive;
 
 struct_message_receive myDataReceive;
+sensor_message outMsg;
+sensor_message inMsg;
+volatile bool responseReceived = false;
 
 OneWire32 ds(TEMP_PIN);
 const uint8_t maxDevices = 2;  // max devices per bus
@@ -82,9 +86,10 @@ bool bNoSleep = false; // Flag to prevent deep sleep
 int batteryLevel;
 float localTemperature;
 
-// REPLACE WITH Pool Controller MAC Address
+// REPLACE WITH Bridge MAC Address
 // 54:32:04:11:D4:FC
-uint8_t broadcastAddress[] = {0x54, 0x32, 0x04, 0x11, 0xD4, 0xFC};
+// MAC=E4:B3:23:B5:77:4D (Xiao C6)
+uint8_t broadcastAddress[] = {0xE4, 0xB3, 0x23, 0xB5, 0x77, 0x4D};
 //uint8_t broadcastAddress[] = {0x54, 0x32, 0x04, 0x11, 0xD4, 0xFC};
 
 void OnDataRecv(const esp_now_recv_info_t *esp_now_info, const uint8_t *incomingData, int len);
@@ -96,17 +101,65 @@ void updateDisplay_BatteryState();
 bool isValidTemperatureAir(float temp);
 void measureTemperature();
 void setPoolControlMode(String mode);
+void setPoolControlMode(Mode mode);
 void measureVoltage();
 void getPoolControlValues();
 void prepareDisplay();
 void setSensorData();
-void sendMessage(String payload);
+void sendMessage(String id, String payload);
 void btnTaskHandling(void *parameter);
 void checkButtons();
 void checkButtons(int wakeupBtnPin);
 void startDeepSleep();
 
+static bool parseLastUpdateFromJson(const JsonVariantConst& v, tm& outTm) {
+  if (v.is<long>()) {
+    time_t ts = static_cast<time_t>(v.as<long>());
+    localtime_r(&ts, &outTm);
+    return true;
+  }
+
+  if (v.is<const char*>()) {
+    const char* s = v.as<const char*>();
+    int year, month, day, hour, minute, second;
+    if (sscanf(s, "%d-%d-%d %d:%d:%d", &year, &month, &day, &hour, &minute, &second) == 6) {
+      memset(&outTm, 0, sizeof(outTm));
+      outTm.tm_year = year - 1900;
+      outTm.tm_mon = month - 1;
+      outTm.tm_mday = day;
+      outTm.tm_hour = hour;
+      outTm.tm_min = minute;
+      outTm.tm_sec = second;
+      return true;
+    }
+  }
+
+  return false;
+}
+
+static void formatDateTimeGerman(const tm& value, char* out, size_t outSize) {
+  static const char* monthsDe[] = {
+    "Januar", "Februar", "März", "April", "Mai", "Juni",
+    "Juli", "August", "September", "Oktober", "November", "Dezember"
+  };
+
+  const int mon = value.tm_mon;
+  const char* month = (mon >= 0 && mon < 12) ? monthsDe[mon] : "???";
+  snprintf(out, outSize, "%02d. %s %04d %02d:%02d:%02d",
+           value.tm_mday, month, value.tm_year + 1900,
+           value.tm_hour, value.tm_min, value.tm_sec);
+}
+
+static void getStatusRowLayout(int16_t& batteryX, int16_t& batteryY, uint16_t& batteryW, uint16_t& batteryH) {
+  batteryW = 25;
+  batteryH = 25;
+  const int16_t midLineY = (int16_t)(display.height() * 2 / 3);
+  batteryX = (int16_t)display.width() - (int16_t)batteryW;
+  batteryY = midLineY + 2; // directly below the middle line
+}
+
 RTC_DATA_ATTR int bootCount = 0;
+volatile int pendingModeCommand = -1; // -1 none, otherwise Mode enum value
 
 void print_wakeup_reason(){
   esp_sleep_wakeup_cause_t wakeup_reason;
@@ -131,7 +184,7 @@ void setup() {
 
   // Wifi config
   WiFi.mode(WIFI_STA);
-  Serial.print("MAC-Address: ");
+  Serial.print("MAC address: ");
   Serial.println(WiFi.macAddress());
 
   // Init ESP-NOW
@@ -144,7 +197,7 @@ void setup() {
 
   esp_now_peer_info_t peerInfo;
   memcpy(peerInfo.peer_addr, broadcastAddress, 6);
-  peerInfo.channel = 0;  
+  peerInfo.channel = 1;  
   peerInfo.encrypt = false; 
  
   esp_err_t err = esp_now_add_peer(&peerInfo);
@@ -175,7 +228,7 @@ void setup() {
 		Serial.printf("Temp %d: 0x%llx,\n", j, addr[j]);
 	}
 
-  xTaskCreate(btnTaskHandling, "btnTaskHandling", 1024, NULL, 1, NULL);
+  xTaskCreate(btnTaskHandling, "btnTaskHandling", 2048, NULL, 1, NULL);
   ++bootCount;
   Serial.println("Boot number: " + String(bootCount));
 
@@ -184,6 +237,12 @@ void setup() {
 }
 
 void loop() {
+  if (pendingModeCommand >= 0) {
+    const Mode requestedMode = static_cast<Mode>(pendingModeCommand);
+    pendingModeCommand = -1;
+    setPoolControlMode(requestedMode);
+  }
+
   measureTemperature();
   measureVoltage();
   setSensorData();
@@ -198,8 +257,8 @@ void loop() {
     Serial.println("No sleep requested, waiting for button press...");
     bNoSleep = false; // reset flag
   } else {
-    Serial.println("Going to deep sleep...");
-    startDeepSleep();
+    //Serial.println("Going to deep sleep...");
+    //startDeepSleep();
   }
   delay(7000);
 }
@@ -221,11 +280,46 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
 // callback function that will be executed when data is received
 void OnDataRecv(const esp_now_recv_info_t *esp_now_info, const uint8_t *incomingData, int len) {
   memcpy(&myDataReceive, incomingData, sizeof(myDataReceive));
-  Serial.printf("%.1f°C", myDataReceive.averageTempWater);
-  Serial.println("Data received...refresh values");
-  Serial.println(myDataReceive.lastUpdate.tm_year);
-  updateDisplay_PoolControlValues();
-  updateDisplay_LastUpdate();
+
+  if (len != sizeof(sensor_message)) return;
+
+  memcpy(&inMsg, incomingData, sizeof(sensor_message));
+  inMsg.id[sizeof(inMsg.id) - 1]           = '\0';
+  inMsg.payload[sizeof(inMsg.payload) - 1] = '\0';
+
+  // Response to get-values?
+  if (strcmp(inMsg.id, "values") == 0) {
+    responseReceived = true;
+    Serial.printf("[NODE] Incoming response: %s\n", inMsg.payload);
+    // Parse and use payload, e.g. for control logic:
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, inMsg.payload);
+    if (error) {
+      Serial.print("Error parsing JSON: ");
+      Serial.println(error.c_str());
+      return;
+    }
+    // Example: extract values
+    if (doc["averageTempWater"].is<float>())
+      myDataReceive.averageTempWater = doc["averageTempWater"];
+    if (doc["averageTempAir"].is<float>())
+      myDataReceive.averageTempAir = doc["averageTempAir"];
+    if (doc["targetTemp"].is<float>())
+      myDataReceive.targetTemp = doc["targetTemp"];
+    if (doc["mode"].is<int>())
+      myDataReceive.mode = static_cast<Mode>(doc["mode"].as<int>());
+    if (doc["currentValveState"].is<int>())
+      myDataReceive.currentValveState = static_cast<ValveState>(doc["currentValveState"].as<int>());
+    if (doc["currentPumpState"].is<int>())
+      myDataReceive.currentPumpState = doc["currentPumpState"];
+    parseLastUpdateFromJson(doc["lastUpdate"], myDataReceive.lastUpdate);
+      
+    updateDisplay_PoolControlValues();
+    updateDisplay_LastUpdate();
+ 
+  } else {
+    Serial.printf("[NODE] Incoming message with unknown id: %s\n", inMsg.id);
+  }
 }
 
 void btnTaskHandling(void *parameter){
@@ -243,15 +337,15 @@ void checkButtons(int wakeupBtnPin)
 
   if (btnL > 0) {
     Serial.println("Button L pressed");
-    setPoolControlMode("AUTO");
+    pendingModeCommand = AUTO;
   }
   if (btnM > 0) {
     Serial.println("Button M pressed");
-    setPoolControlMode("ON");
+    pendingModeCommand = ON;
   }
   if (btnR > 0) {
     Serial.println("Button R pressed");
-    setPoolControlMode("OFF");
+    pendingModeCommand = OFF;
   }
 }
 
@@ -309,12 +403,19 @@ void measureTemperature(){
   updateDisplay_Temperature();
 }
 
-void sendMessage(String payload)
-{
+void sendMessage(String id, String payload) {
   Serial.println("Sending message: " + payload);
-    Serial.println(WiFi.macAddress());
+  Serial.println(WiFi.macAddress());
 
-  esp_err_t result = esp_now_send(broadcastAddress, (uint8_t*)payload.c_str(), payload.length());
+  memset(&outMsg, 0, sizeof(outMsg));
+  strncpy(outMsg.id, id.c_str(), sizeof(outMsg.id) - 1);
+
+  strncpy(outMsg.payload, payload.c_str(), sizeof(outMsg.payload) - 1);
+
+  // outMsg.payload[0] = '\0';
+
+  responseReceived = false;
+  esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *)&outMsg, sizeof(outMsg));
   if (result == ESP_OK) {
     Serial.println("Sent with success");
   }
@@ -324,31 +425,21 @@ void sendMessage(String payload)
 }
 
 void getPoolControlValues() {
-  JsonDocument doc;
-
-  // Add values in the document
-  doc["cmd"] = "get-values";
-
-  String payload = "";
-
-  // Generate the minified JSON and send it to the Serial port
-  serializeJson(doc,payload);
-  sendMessage(payload);
+  sendMessage("get-values", "");
 }
 
 void setPoolControlMode(String mode) {
-  // Send message via ESP-NOW
-  JsonDocument doc;
+  sendMessage("set-mode", "{\"mode\":\"" + mode + "\"}");
+}
 
-  // Add values in the document
-  doc["cmd"] = "set-mode";
-  doc["mode"] = mode.c_str();
-
-  String payload = "";
-
-  // Generate the minified JSON and send it to the Serial port
-  serializeJson(doc,payload);
-  sendMessage(payload);
+void setPoolControlMode(Mode mode) {
+  switch (mode) {
+    case AUTO: setPoolControlMode("AUTO"); break;
+    case ON: setPoolControlMode("ON"); break;
+    case OFF: setPoolControlMode("OFF"); break;
+    case CLEANING: setPoolControlMode("CLEANING"); break;
+    default: break;
+  }
 }
 
 void setSensorData()
@@ -357,7 +448,6 @@ void setSensorData()
   JsonDocument doc;
 
   // Add values in the document
-  doc["cmd"] = "set-sensordata";
   doc["sensor"] = "temperature";
   doc["location"] = "pavilion";
   doc["value"] = localTemperature;
@@ -368,7 +458,7 @@ void setSensorData()
 
   // Generate the minified JSON and send it to the Serial port
   serializeJson(doc,payload);
-  sendMessage(payload);
+  sendMessage("set-sensordata", payload);
 }
 
 void prepareDisplay(){
@@ -394,7 +484,7 @@ void prepareDisplay(){
     display.drawBitmap(2*display.width()/3-33, y-60,epd_bitmap_solar, 25, 25, GxEPD_WHITE,0);
     display.drawBitmap(display.width()-33, y-60,epd_bitmap_pavilion, 25, 25, GxEPD_WHITE,0);
   
-    display.drawBitmap(x, display.height()-19,epd_bitmap_full_battery, 25, 25, GxEPD_WHITE,0);
+    //display.drawBitmap(x, display.height()-19,epd_bitmap_full_battery, 25, 25, GxEPD_WHITE,0);
 
     display.setCursor(x, display.height()-20);
     display.setFont(&FreeSans9pt7b);
@@ -495,13 +585,7 @@ void updateDisplay_Temperature(){
 }
 
 void updateDisplay_LastUpdate(){
-  return;
-  uint16_t box_w = 100;
-  uint16_t box_h = 10;
-  uint16_t box_x = 200;
-  uint16_t box_y = display.height()-10; 
-  Serial.println(&myDataReceive.lastUpdate, "%A, %B %d %Y %H:%M:%S");
-  
+  // return;
   if (myDataReceive.lastUpdate.tm_year == 0)
   {
     // no last update time available
@@ -509,38 +593,62 @@ void updateDisplay_LastUpdate(){
     return;
   }
 
-  // last update 
+  char lastUpdateText[48];
+  formatDateTimeGerman(myDataReceive.lastUpdate, lastUpdateText, sizeof(lastUpdateText));
+  Serial.println(lastUpdateText);
+
+  // last update
   display.setRotation(3);
   display.setFont(&TomThumb);
   display.setTextColor(GxEPD_BLACK);
-  display.setPartialWindow(box_x, box_y, box_w, box_h);
+  int16_t x1, y1;
+  uint16_t textW, textH;
+  display.getTextBounds(lastUpdateText, 0, 0, &x1, &y1, &textW, &textH);
+  int16_t batteryX, batteryY;
+  uint16_t batteryW, batteryH;
+  getStatusRowLayout(batteryX, batteryY, batteryW, batteryH);
+
+  const int16_t gap = 4;
+  int16_t textX = batteryX - gap - (int16_t)textW;
+  if (textX < 0) textX = 0;
+  int16_t textBaselineY = batteryY + (int16_t)textH + 8; // center the height of the battery icon 
+  if (textBaselineY > (int16_t)display.height()) textBaselineY = (int16_t)display.height();
+
+  int16_t box_x = textX;
+  int16_t box_y = batteryY;
+  uint16_t box_w = (uint16_t)(batteryX - textX);
+  uint16_t box_h = batteryH;
+
+  display.setPartialWindow(box_x, box_y+1, box_w, box_h);
   display.firstPage();
   do
   {
     display.fillRect(box_x, box_y, box_w, box_h, GxEPD_WHITE);
-    display.setCursor(box_x, box_y);
-    display.println(&myDataReceive.lastUpdate, "%B %d %Y %H:%M:%S");
-    Serial.println(&myDataReceive.lastUpdate, "%A, %B %d %Y %H:%M:%S");
+    display.setCursor(textX, textBaselineY);
+    display.println(lastUpdateText);
+    Serial.println(lastUpdateText);
   }
   while (display.nextPage());
 
 }
 
 void updateDisplay_BatteryState(){
-  uint16_t x = 5;
-  uint16_t y = 67; 
-  uint16_t box_w = 25;
-  uint16_t box_h = 19;
-  uint16_t box_x = x;
-  uint16_t box_y = display.height()-10; 
+  int16_t iconX, iconY;
+  uint16_t box_w, box_h;
+  getStatusRowLayout(iconX, iconY, box_w, box_h);
+  int16_t box_x = iconX;
+  int16_t box_y = iconY;
 
   display.setRotation(3);
-  display.setPartialWindow(box_x, box_y, box_w, box_h);
+  display.setPartialWindow(box_x, box_y+1, box_w, box_h);
   display.firstPage();
   do
   {
+    display.fillRect(box_x, box_y, box_w, box_h, GxEPD_WHITE);
+    //display.drawRect(iconX, iconY, 25, 25, GxEPD_BLACK);
+
     Serial.printf("Battery-Level:%d, Map:%d\n", batteryLevel, map(batteryLevel, 0, 100, 4, 0));
-    display.drawBitmap(x, display.height()-19,epd_bitmap_batteryArray[map(batteryLevel, 0, 100, 4, 0)], 25, 25, GxEPD_WHITE,0);
+    display.drawBitmap(iconX, iconY-2, epd_bitmap_batteryArray[map(batteryLevel, 0, 100, 4, 0)], 25, 25, GxEPD_WHITE, 0);
   }
   while (display.nextPage());
 }
