@@ -95,6 +95,7 @@ uint8_t broadcastAddress[] = {0xE4, 0xB3, 0x23, 0xB5, 0x77, 0x4D};
 void OnDataRecv(const esp_now_recv_info_t *esp_now_info, const uint8_t *incomingData, int len);
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status);
 void updateDisplay_PoolControlValues();
+void updateDisplay_ButtonHints();
 void updateDisplay_LastUpdate();
 void updateDisplay_Temperature();
 void updateDisplay_BatteryState();
@@ -145,8 +146,8 @@ static void formatDateTimeGerman(const tm& value, char* out, size_t outSize) {
 
   const int mon = value.tm_mon;
   const char* month = (mon >= 0 && mon < 12) ? monthsDe[mon] : "???";
-  snprintf(out, outSize, "%02d. %s %04d %02d:%02d:%02d",
-           value.tm_mday, month, value.tm_year + 1900,
+  snprintf(out, outSize, "%02d.%02d.%02d %02d:%02d:%02d",
+           value.tm_mday, value.tm_mon + 1, (value.tm_year + 1900) % 100,
            value.tm_hour, value.tm_min, value.tm_sec);
 }
 
@@ -485,10 +486,48 @@ void prepareDisplay(){
     display.drawBitmap(display.width()-33, y-60,epd_bitmap_pavilion, 25, 25, GxEPD_WHITE,0);
   
     //display.drawBitmap(x, display.height()-19,epd_bitmap_full_battery, 25, 25, GxEPD_WHITE,0);
+  }
+  while (display.nextPage());
 
-    display.setCursor(x, display.height()-20);
-    display.setFont(&FreeSans9pt7b);
-    display.printf("Aktualisiere...");
+  updateDisplay_ButtonHints();
+}
+
+void updateDisplay_ButtonHints() {
+  const int16_t box_x = 0;
+  const uint16_t box_w = display.width();
+  const uint16_t box_h = 13;
+  const int16_t box_y = display.height() - box_h;
+
+  display.setRotation(3);
+  display.setFont(nullptr);
+  display.setTextSize(1);
+  display.setTextColor(GxEPD_BLACK);
+  display.setPartialWindow(box_x, box_y, box_w, box_h);
+  display.firstPage();
+  do
+  {
+    display.fillRect(box_x, box_y, box_w, box_h, GxEPD_WHITE);
+
+    const int16_t slotW = box_w / 3;
+    const int16_t cy = box_y + (box_h / 2) - 1;
+    const int16_t r = 6;
+
+    const int16_t autoCx = box_x + (slotW / 2) + 10;
+    const int16_t onCx = box_x + slotW + (slotW / 2);
+    const int16_t offCx = box_x + 2 * slotW + (slotW / 2) - 8;
+
+    // AUTO: circle + A
+    display.drawCircle(autoCx, cy, r, GxEPD_BLACK);
+    display.setCursor(autoCx - 2, cy - 3);
+    display.print("A");
+
+    // ON: circle + play symbol
+    display.drawCircle(onCx, cy, r, GxEPD_BLACK);
+    display.fillTriangle(onCx - 2, cy - 2, onCx - 2, cy + 2, onCx + 2, cy, GxEPD_BLACK);
+
+    // OFF: circle + stop symbol
+    display.drawCircle(offCx, cy, r, GxEPD_BLACK);
+    display.fillRect(offCx - 2, cy - 2, 4, 4, GxEPD_BLACK);
   }
   while (display.nextPage());
 }
@@ -533,7 +572,7 @@ void updateDisplay_PoolControlValues(){
   }
   while (display.nextPage());
   
-  // mode 
+  // mode
   box_w = 160;
   box_h = 16;
   box_y = display.height()-20-box_h+2;
@@ -541,7 +580,6 @@ void updateDisplay_PoolControlValues(){
   display.firstPage();
   do
   {
-    //display.drawRect(box_x, box_y, box_w, box_h, GxEPD_BLACK);
     display.fillRect(box_x, box_y, box_w, box_h, GxEPD_WHITE);
     display.setCursor(x, display.height()-20);
     display.setFont(&FreeSans9pt7b);
@@ -553,7 +591,9 @@ void updateDisplay_PoolControlValues(){
     }
    }
   while (display.nextPage());
+
   updateDisplay_LastUpdate();
+  updateDisplay_ButtonHints();
 }
 
 void updateDisplay_Temperature(){
@@ -599,7 +639,8 @@ void updateDisplay_LastUpdate(){
 
   // last update
   display.setRotation(3);
-  display.setFont(&TomThumb);
+  display.setFont(nullptr);
+  display.setTextSize(1);
   display.setTextColor(GxEPD_BLACK);
   int16_t x1, y1;
   uint16_t textW, textH;
@@ -611,7 +652,7 @@ void updateDisplay_LastUpdate(){
   const int16_t gap = 4;
   int16_t textX = batteryX - gap - (int16_t)textW;
   if (textX < 0) textX = 0;
-  int16_t textBaselineY = batteryY + (int16_t)textH + 8; // center the height of the battery icon 
+  int16_t textBaselineY = batteryY + ((int16_t)batteryH - (int16_t)textH) / 2 - 1;
   if (textBaselineY > (int16_t)display.height()) textBaselineY = (int16_t)display.height();
 
   int16_t box_x = textX;
@@ -619,11 +660,12 @@ void updateDisplay_LastUpdate(){
   uint16_t box_w = (uint16_t)(batteryX - textX);
   uint16_t box_h = batteryH;
 
-  display.setPartialWindow(box_x, box_y+1, box_w, box_h);
+  display.setPartialWindow(box_x, box_y+1, box_w, box_h-1);
   display.firstPage();
   do
   {
     display.fillRect(box_x, box_y, box_w, box_h, GxEPD_WHITE);
+    //display.drawRect(box_x, box_y, box_w, box_h, GxEPD_BLACK);
     display.setCursor(textX, textBaselineY);
     display.println(lastUpdateText);
     Serial.println(lastUpdateText);
@@ -646,6 +688,7 @@ void updateDisplay_BatteryState(){
   {
     display.fillRect(box_x, box_y, box_w, box_h, GxEPD_WHITE);
     //display.drawRect(iconX, iconY, 25, 25, GxEPD_BLACK);
+    //display.drawRect(box_x, box_y, box_w, box_h, GxEPD_BLACK);
 
     Serial.printf("Battery-Level:%d, Map:%d\n", batteryLevel, map(batteryLevel, 0, 100, 4, 0));
     display.drawBitmap(iconX, iconY-2, epd_bitmap_batteryArray[map(batteryLevel, 0, 100, 4, 0)], 25, 25, GxEPD_WHITE, 0);
