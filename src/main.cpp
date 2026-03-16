@@ -32,7 +32,7 @@
 #define BUTTON_PIN_BITMASK (1ULL << BUTTON1_PIN) | (1ULL << BUTTON2_PIN) | (1ULL << BUTTON3_PIN)
 //| (1ULL << BUTTON3_PIN) // GPIO 0 bitmask for ext1
 
-const char* firmware = "0.6.1";
+const char* firmware = "0.6.2";
 Button btnLeft(BUTTON1_PIN);
 Button btnMiddle(BUTTON2_PIN);
 Button btnRight(BUTTON3_PIN);
@@ -86,11 +86,12 @@ bool bNoSleep = false; // Flag to prevent deep sleep
 int batteryLevel;
 float localTemperature;
 
-// REPLACE WITH Bridge MAC Address
-// 54:32:04:11:D4:FC
-// MAC=E4:B3:23:B5:77:4C (Xiao C6)
-uint8_t broadcastAddress[] = {0xE4, 0xB3, 0x23, 0xB5, 0x77, 0x4C};
-//uint8_t broadcastAddress[] = {0x54, 0x32, 0x04, 0x11, 0xD4, 0xFC};
+// ESP-NOW peer discovery
+static uint8_t broadcastMac[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+static uint8_t bridgeMac[6] = {0};
+static bool bridgeKnown = false;
+static unsigned long lastDiscoverMs = 0;
+static const unsigned long DISCOVER_INTERVAL_MS = 2000;
 
 void OnDataRecv(const esp_now_recv_info_t *esp_now_info, const uint8_t *incomingData, int len);
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status);
@@ -112,6 +113,37 @@ void btnTaskHandling(void *parameter);
 void checkButtons();
 void checkButtons(int wakeupBtnPin);
 void startDeepSleep();
+
+static void addPeer(const uint8_t *mac) {
+  if (esp_now_is_peer_exist(mac)) return;
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, mac, 6);
+  peerInfo.channel = 1;
+  peerInfo.encrypt = false;
+  esp_err_t err = esp_now_add_peer(&peerInfo);
+  if (err != ESP_OK) {
+    Serial.println("Failed to add peer");
+  }
+}
+
+static void setBridgeMac(const uint8_t *mac) {
+  memcpy(bridgeMac, mac, 6);
+  bridgeKnown = true;
+  addPeer(bridgeMac);
+  Serial.printf("[NODE] Bridge MAC learned: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                bridgeMac[0], bridgeMac[1], bridgeMac[2],
+                bridgeMac[3], bridgeMac[4], bridgeMac[5]);
+}
+
+static void sendDiscover() {
+  sensor_message msg = {};
+  strncpy(msg.id, "bridge/discover", sizeof(msg.id) - 1);
+  msg.payload[0] = '\0';
+  addPeer(broadcastMac);
+  esp_err_t result = esp_now_send(broadcastMac, (uint8_t *)&msg, sizeof(msg));
+  lastDiscoverMs = millis();
+  Serial.printf("[NODE] Discover sent result=%s\n", result == ESP_OK ? "OK" : "ERROR");
+}
 
 static bool parseLastUpdateFromJson(const JsonVariantConst& v, tm& outTm) {
   if (v.is<long>()) {
@@ -196,17 +228,8 @@ void setup() {
   esp_now_register_recv_cb(OnDataRecv);
   esp_now_register_send_cb(OnDataSent);
 
-  esp_now_peer_info_t peerInfo;
-  memcpy(peerInfo.peer_addr, broadcastAddress, 6);
-  peerInfo.channel = 1;  
-  peerInfo.encrypt = false; 
- 
-  esp_err_t err = esp_now_add_peer(&peerInfo);
-  if (err != ESP_OK)
-  {
-    Serial.println("Failed to add peer");
-    return;
-  }
+  addPeer(broadcastMac);
+  sendDiscover();
 
   if (bootCount == 0)
   {
@@ -238,6 +261,10 @@ void setup() {
 }
 
 void loop() {
+  if (!bridgeKnown && (millis() - lastDiscoverMs > DISCOVER_INTERVAL_MS)) {
+    sendDiscover();
+  }
+
   if (pendingModeCommand >= 0) {
     const Mode requestedMode = static_cast<Mode>(pendingModeCommand);
     pendingModeCommand = -1;
@@ -287,6 +314,11 @@ void OnDataRecv(const esp_now_recv_info_t *esp_now_info, const uint8_t *incoming
   memcpy(&inMsg, incomingData, sizeof(sensor_message));
   inMsg.id[sizeof(inMsg.id) - 1]           = '\0';
   inMsg.payload[sizeof(inMsg.payload) - 1] = '\0';
+
+  if (strcmp(inMsg.id, "bridge/announce") == 0) {
+    setBridgeMac(esp_now_info->src_addr);
+    return;
+  }
 
   // Response to get-values?
   if (strcmp(inMsg.id, "values") == 0) {
@@ -405,6 +437,11 @@ void measureTemperature(){
 }
 
 void sendMessage(String id, String payload) {
+  if (!bridgeKnown && id != "bridge/discover") {
+    sendDiscover();
+    return;
+  }
+
   Serial.println("Sending message: " + payload);
   Serial.println(WiFi.macAddress());
 
@@ -416,7 +453,7 @@ void sendMessage(String id, String payload) {
   // outMsg.payload[0] = '\0';
 
   responseReceived = false;
-  esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *)&outMsg, sizeof(outMsg));
+  esp_err_t result = esp_now_send(bridgeMac, (uint8_t *)&outMsg, sizeof(outMsg));
   if (result == ESP_OK) {
     Serial.println("Sent with success");
   }
