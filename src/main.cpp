@@ -32,7 +32,7 @@
 #define BUTTON_PIN_BITMASK (1ULL << BUTTON1_PIN) | (1ULL << BUTTON2_PIN) | (1ULL << BUTTON3_PIN)
 //| (1ULL << BUTTON3_PIN) // GPIO 0 bitmask for ext1
 
-const char* firmware = "0.6.0";
+const char* firmware = "0.6.1";
 Button btnLeft(BUTTON1_PIN);
 Button btnMiddle(BUTTON2_PIN);
 Button btnRight(BUTTON3_PIN);
@@ -88,8 +88,8 @@ float localTemperature;
 
 // REPLACE WITH Bridge MAC Address
 // 54:32:04:11:D4:FC
-// MAC=E4:B3:23:B5:77:4D (Xiao C6)
-uint8_t broadcastAddress[] = {0xE4, 0xB3, 0x23, 0xB5, 0x77, 0x4D};
+// MAC=E4:B3:23:B5:77:4C (Xiao C6)
+uint8_t broadcastAddress[] = {0xE4, 0xB3, 0x23, 0xB5, 0x77, 0x4C};
 //uint8_t broadcastAddress[] = {0x54, 0x32, 0x04, 0x11, 0xD4, 0xFC};
 
 void OnDataRecv(const esp_now_recv_info_t *esp_now_info, const uint8_t *incomingData, int len);
