@@ -14,6 +14,7 @@
 #include <ArduinoJson.h>
 #include <Button.h>
 #include <driver/rtc_io.h>
+#include <Preferences.h>
 #include <time.h>
 #include "sensor_message.h"
 
@@ -92,6 +93,8 @@ static uint8_t bridgeMac[6] = {0};
 static bool bridgeKnown = false;
 static unsigned long lastDiscoverMs = 0;
 static const unsigned long DISCOVER_INTERVAL_MS = 2000;
+static const unsigned long DISCOVER_INTERVAL_MAX_MS = 30000;
+static unsigned long discoverIntervalMs = DISCOVER_INTERVAL_MS;
 
 void OnDataRecv(const esp_now_recv_info_t *esp_now_info, const uint8_t *incomingData, int len);
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status);
@@ -126,13 +129,42 @@ static void addPeer(const uint8_t *mac) {
   }
 }
 
+static bool macEquals(const uint8_t *a, const uint8_t *b) {
+  return memcmp(a, b, 6) == 0;
+}
+
+static void storeBridgeMac(const uint8_t *mac) {
+  Preferences prefs;
+  if (!prefs.begin("bridge", false)) return;
+  prefs.putBytes("mac", mac, 6);
+  prefs.end();
+}
+
 static void setBridgeMac(const uint8_t *mac) {
+  if (bridgeKnown && macEquals(bridgeMac, mac)) return;
   memcpy(bridgeMac, mac, 6);
   bridgeKnown = true;
   addPeer(bridgeMac);
+  discoverIntervalMs = DISCOVER_INTERVAL_MS;
+  storeBridgeMac(bridgeMac);
   Serial.printf("[NODE] Bridge MAC learned: %02X:%02X:%02X:%02X:%02X:%02X\n",
                 bridgeMac[0], bridgeMac[1], bridgeMac[2],
                 bridgeMac[3], bridgeMac[4], bridgeMac[5]);
+}
+
+static bool loadBridgeMac() {
+  Preferences prefs;
+  if (!prefs.begin("bridge", true)) return false;
+  size_t len = prefs.getBytesLength("mac");
+  if (len != 6) {
+    prefs.end();
+    return false;
+  }
+  uint8_t mac[6] = {0};
+  prefs.getBytes("mac", mac, 6);
+  prefs.end();
+  setBridgeMac(mac);
+  return true;
 }
 
 static void sendDiscover() {
@@ -142,6 +174,9 @@ static void sendDiscover() {
   addPeer(broadcastMac);
   esp_err_t result = esp_now_send(broadcastMac, (uint8_t *)&msg, sizeof(msg));
   lastDiscoverMs = millis();
+  if (discoverIntervalMs < DISCOVER_INTERVAL_MAX_MS) {
+    discoverIntervalMs = min(discoverIntervalMs * 2, DISCOVER_INTERVAL_MAX_MS);
+  }
   Serial.printf("[NODE] Discover sent result=%s\n", result == ESP_OK ? "OK" : "ERROR");
 }
 
@@ -229,7 +264,9 @@ void setup() {
   esp_now_register_send_cb(OnDataSent);
 
   addPeer(broadcastMac);
-  sendDiscover();
+  if (!loadBridgeMac()) {
+    sendDiscover();
+  }
 
   if (bootCount == 0)
   {
@@ -261,7 +298,7 @@ void setup() {
 }
 
 void loop() {
-  if (!bridgeKnown && (millis() - lastDiscoverMs > DISCOVER_INTERVAL_MS)) {
+  if (!bridgeKnown && (millis() - lastDiscoverMs > discoverIntervalMs)) {
     sendDiscover();
   }
 
