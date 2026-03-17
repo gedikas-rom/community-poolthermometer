@@ -14,6 +14,7 @@
 #include <ArduinoJson.h>
 #include <Button.h>
 #include <driver/rtc_io.h>
+#include <math.h>
 #include <Preferences.h>
 #include <time.h>
 #include "sensor_message.h"
@@ -33,7 +34,7 @@
 #define BUTTON_PIN_BITMASK (1ULL << BUTTON1_PIN) | (1ULL << BUTTON2_PIN) | (1ULL << BUTTON3_PIN)
 //| (1ULL << BUTTON3_PIN) // GPIO 0 bitmask for ext1
 
-const char* firmware = "0.6.2";
+const char* firmware = "0.6.3";
 Button btnLeft(BUTTON1_PIN);
 Button btnMiddle(BUTTON2_PIN);
 Button btnRight(BUTTON3_PIN);
@@ -87,6 +88,14 @@ bool bNoSleep = false; // Flag to prevent deep sleep
 int batteryLevel;
 float localTemperature;
 
+// Display change tracking
+static int lastBatteryLevel = -1;
+static int lastLocalTempDeci = -10000;
+static int lastPoolWaterDeci = -10000;
+static int lastPoolAirDeci = -10000;
+static Mode lastMode = AUTO;
+static bool lastModeValid = false;
+
 // ESP-NOW peer discovery
 static uint8_t broadcastMac[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 static uint8_t bridgeMac[6] = {0};
@@ -95,6 +104,7 @@ static unsigned long lastDiscoverMs = 0;
 static const unsigned long DISCOVER_INTERVAL_MS = 2000;
 static const unsigned long DISCOVER_INTERVAL_MAX_MS = 30000;
 static unsigned long discoverIntervalMs = DISCOVER_INTERVAL_MS;
+static const unsigned long RESPONSE_WAIT_MS = 1200;
 
 void OnDataRecv(const esp_now_recv_info_t *esp_now_info, const uint8_t *incomingData, int len);
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status);
@@ -116,6 +126,11 @@ void btnTaskHandling(void *parameter);
 void checkButtons();
 void checkButtons(int wakeupBtnPin);
 void startDeepSleep();
+void shutdownRadio();
+
+static int toDeci(float value) {
+  return (int)lroundf(value * 10.0f);
+}
 
 static void addPeer(const uint8_t *mac) {
   if (esp_now_is_peer_exist(mac)) return;
@@ -298,10 +313,6 @@ void setup() {
 }
 
 void loop() {
-  if (!bridgeKnown && (millis() - lastDiscoverMs > discoverIntervalMs)) {
-    sendDiscover();
-  }
-
   if (pendingModeCommand >= 0) {
     const Mode requestedMode = static_cast<Mode>(pendingModeCommand);
     pendingModeCommand = -1;
@@ -310,8 +321,13 @@ void loop() {
 
   measureTemperature();
   measureVoltage();
-  setSensorData();
-  delay(3000);
+  if (bridgeKnown) {
+    setSensorData();
+    const unsigned long waitStart = millis();
+    while (!responseReceived && (millis() - waitStart < RESPONSE_WAIT_MS)) {
+      delay(20);
+    }
+  }
   //getPoolControlValues();
   //delay(2000);
   //updateDisplay_LastUpdate();
@@ -322,10 +338,11 @@ void loop() {
     Serial.println("No sleep requested, waiting for button press...");
     bNoSleep = false; // reset flag
   } else {
-    //Serial.println("Going to deep sleep...");
-    //startDeepSleep();
+    Serial.println("Going to deep sleep...");
+    shutdownRadio();
+    startDeepSleep();
   }
-  delay(7000);
+  delay(250);
 }
 
 void startDeepSleep(){
@@ -334,6 +351,11 @@ void startDeepSleep(){
   esp_sleep_enable_ext1_wakeup(BUTTON_PIN_BITMASK,ESP_EXT1_WAKEUP_ANY_LOW);
   esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
   esp_deep_sleep_start();
+}
+
+void shutdownRadio(){
+  esp_now_deinit();
+  WiFi.mode(WIFI_OFF);
 }
 
 // callback when data is sent
@@ -383,8 +405,21 @@ void OnDataRecv(const esp_now_recv_info_t *esp_now_info, const uint8_t *incoming
     if (doc["currentPumpState"].is<int>())
       myDataReceive.currentPumpState = doc["currentPumpState"];
     parseLastUpdateFromJson(doc["lastUpdate"], myDataReceive.lastUpdate);
-      
-    updateDisplay_PoolControlValues();
+
+    const int waterDeci = toDeci(myDataReceive.averageTempWater);
+    const int airDeci = toDeci(myDataReceive.averageTempAir);
+    const bool modeChanged = (!lastModeValid || lastMode != myDataReceive.mode);
+    const bool tempsChanged = (waterDeci != lastPoolWaterDeci) || (airDeci != lastPoolAirDeci);
+
+    if (tempsChanged || modeChanged) {
+      updateDisplay_PoolControlValues();
+      lastPoolWaterDeci = waterDeci;
+      lastPoolAirDeci = airDeci;
+      lastMode = myDataReceive.mode;
+      lastModeValid = true;
+    }
+
+    // Always update the "last update" time.
     updateDisplay_LastUpdate();
  
   } else {
@@ -436,7 +471,10 @@ void measureVoltage(){
   voltage = voltage < 3400 ? 3400 : voltage; // limit to 3.4V 
   //float voltage = random(3412, 4095); // analogRead(VOLTAGE_PIN);
   batteryLevel = map(voltage, 3400, 4000, 0, 100);
-  updateDisplay_BatteryState();
+  if (batteryLevel != lastBatteryLevel) {
+    updateDisplay_BatteryState();
+    lastBatteryLevel = batteryLevel;
+  }
 }
 
 bool isValidTemperatureAir(float temp){
@@ -470,12 +508,18 @@ void measureTemperature(){
     localTemperature = random(1200, 2900)/100;
   
   Serial.printf("Local Temp: %.1f\n", localTemperature);
-  updateDisplay_Temperature();
+  const int localDeci = toDeci(localTemperature);
+  if (localDeci != lastLocalTempDeci) {
+    updateDisplay_Temperature();
+    lastLocalTempDeci = localDeci;
+  }
 }
 
 void sendMessage(String id, String payload) {
   if (!bridgeKnown && id != "bridge/discover") {
-    sendDiscover();
+    if (millis() - lastDiscoverMs > discoverIntervalMs) {
+      sendDiscover();
+    }
     return;
   }
 
@@ -496,6 +540,9 @@ void sendMessage(String id, String payload) {
   }
   else {
     Serial.println("Error sending the data");
+    if (id != "bridge/discover") {
+      sendDiscover();
+    }
   }
 }
 
@@ -666,8 +713,6 @@ void updateDisplay_PoolControlValues(){
    }
   while (display.nextPage());
 
-  updateDisplay_LastUpdate();
-  updateDisplay_ButtonHints();
 }
 
 void updateDisplay_Temperature(){
