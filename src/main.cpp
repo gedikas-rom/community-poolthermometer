@@ -34,7 +34,7 @@
 #define BUTTON_PIN_BITMASK (1ULL << BUTTON1_PIN) | (1ULL << BUTTON2_PIN) | (1ULL << BUTTON3_PIN)
 //| (1ULL << BUTTON3_PIN) // GPIO 0 bitmask for ext1
 
-const char* firmware = "0.6.3";
+const char* firmware = "0.6.4"; // Firmware version
 Button btnLeft(BUTTON1_PIN);
 Button btnMiddle(BUTTON2_PIN);
 Button btnRight(BUTTON3_PIN);
@@ -243,6 +243,7 @@ static void getStatusRowLayout(int16_t& batteryX, int16_t& batteryY, uint16_t& b
 
 RTC_DATA_ATTR int bootCount = 0;
 volatile int pendingModeCommand = -1; // -1 none, otherwise Mode enum value
+static bool modeChangeRequested = false;
 
 void print_wakeup_reason(){
   esp_sleep_wakeup_cause_t wakeup_reason;
@@ -317,12 +318,17 @@ void loop() {
     const Mode requestedMode = static_cast<Mode>(pendingModeCommand);
     pendingModeCommand = -1;
     setPoolControlMode(requestedMode);
+    modeChangeRequested = true;
   }
 
   measureTemperature();
   measureVoltage();
   if (bridgeKnown) {
     setSensorData();
+    if (modeChangeRequested) {
+      responseReceived = false;
+      getPoolControlValues();
+    }
     const unsigned long waitStart = millis();
     while (!responseReceived && (millis() - waitStart < RESPONSE_WAIT_MS)) {
       delay(20);
@@ -334,9 +340,10 @@ void loop() {
   // check middle button to prevent deep sleep
   bNoSleep = (btnMiddle.checkBtn() == 2); // long press on middle button
   Serial.printf("bNoSleep: %d, %d\n", bNoSleep, btnMiddle.checkBtn());  
-  if (bNoSleep) {
+  if (bNoSleep || modeChangeRequested) {
     Serial.println("No sleep requested, waiting for button press...");
     bNoSleep = false; // reset flag
+    modeChangeRequested = false;
   } else {
     Serial.println("Going to deep sleep...");
     shutdownRadio();
