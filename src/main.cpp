@@ -29,12 +29,18 @@
 #define RST_PIN 17   // Display RST Pin
 #define DC_PIN 20    // Display DC Pin
 
+// XIAO ESP32-C6 RF switch pins:
+// GPIO3  -> WiFi function enable (LOW = enabled)
+// GPIO14 -> antenna select (HIGH = external antenna, LOW = onboard antenna)
+static constexpr uint8_t XIAO_C6_WIFI_ENABLE_PIN = 3;
+static constexpr uint8_t XIAO_C6_WIFI_ANT_PIN    = 14;
+
 #define uS_TO_S_FACTOR 1000000ULL  /* Conversion factor for micro seconds to seconds */
 #define TIME_TO_SLEEP  120        /* Time ESP32 will go to sleep (in seconds) */
 #define BUTTON_PIN_BITMASK (1ULL << BUTTON1_PIN) | (1ULL << BUTTON2_PIN) | (1ULL << BUTTON3_PIN)
 //| (1ULL << BUTTON3_PIN) // GPIO 0 bitmask for ext1
 
-const char* firmware = "0.6.4"; // Firmware version
+const char* firmware = "0.6.6 "; // Firmware version
 Button btnLeft(BUTTON1_PIN);
 Button btnMiddle(BUTTON2_PIN);
 Button btnRight(BUTTON3_PIN);
@@ -265,6 +271,14 @@ void setup() {
   Serial.begin(115200);
   // Pin config
   pinMode(VOLTAGE_PIN, INPUT);         // Configure A5 as ADC input
+
+#if defined(ARDUINO_XIAO_ESP32C6)
+  pinMode(XIAO_C6_WIFI_ENABLE_PIN, OUTPUT);
+  digitalWrite(XIAO_C6_WIFI_ENABLE_PIN, LOW);
+  pinMode(XIAO_C6_WIFI_ANT_PIN, OUTPUT);
+  digitalWrite(XIAO_C6_WIFI_ANT_PIN, HIGH);
+  Serial.println("[NODE] XIAO C6 antenna set to EXTERNAL");
+#endif
 
   // Wifi config
   WiFi.mode(WIFI_STA);
